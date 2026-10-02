@@ -12,8 +12,8 @@ Databricks Volume ab:
 Inkrementell: Die STAC-Checksumme jeder hochgeladenen Datei steht im Manifest.
 Unveränderte Dateien werden übersprungen, geänderte überschrieben.
 
-Zugangsdaten: Prefect Secret Block "databricks-credentials" mit JSON
-    {"host": "https://<workspace>.cloud.databricks.com", "token": "dapi..."}
+Zugangsdaten: Prefect-Block vom Typ "Databricks Credentials" mit Namen
+"databricks-credentials" (Felder: Databricks Instance + Token).
 
 Aufruf lokal (optional):
     python meteoswiss_to_volume.py                         # alle Stationen
@@ -39,8 +39,8 @@ import httpx
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.errors import NotFound
 from prefect import flow, get_run_logger, task
-from prefect.blocks.system import Secret
 from prefect.cache_policies import NO_CACHE
+from prefect_databricks import DatabricksCredentials
 
 # --------------------------------------------------------------------------- #
 # Konfiguration
@@ -75,6 +75,25 @@ class Asset:
     checksum: str | None  # STAC file:checksum (Multihash, "1220" + sha256-hex)
     updated: str | None
     folder: str           # Unterordner (Station oder "_meta")
+
+
+def _normalize_list(value: list[str] | str | None) -> list[str]:
+    """Macht Parameter robust gegen UI-Eingaben wie '["chz"]', 'chz, lug' oder 'chz'."""
+    if value is None:
+        return []
+    items = [value] if isinstance(value, str) else list(value)
+    out: list[str] = []
+    for item in items:
+        text = str(item).strip()
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+                out.extend(str(p) for p in (parsed if isinstance(parsed, list) else [parsed]))
+                continue
+            except json.JSONDecodeError:
+                text = text.strip("[]")
+        out.extend(p for p in re.split(r"[,\s]+", text.replace('"', "").replace("'", "")) if p)
+    return [p.strip().lower() for p in out if p.strip()]
 
 
 # --------------------------------------------------------------------------- #
@@ -165,13 +184,28 @@ _creds: dict | None = None
 _local = threading.local()
 
 
+def _load_credentials() -> dict:
+    """Host + Token aus dem Prefect-Block 'DatabricksCredentials'."""
+    try:
+        block = DatabricksCredentials.load(CREDENTIALS_BLOCK)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Prefect-Block '{CREDENTIALS_BLOCK}' vom Typ 'Databricks Credentials' fehlt "
+            "in diesem Workspace."
+        ) from exc
+    if block.token is None:
+        raise RuntimeError(f"Im Block '{CREDENTIALS_BLOCK}' ist kein Token gesetzt.")
+    instance = block.databricks_instance.strip().rstrip("/")
+    host = instance if instance.startswith("http") else f"https://{instance}"
+    return {"host": host, "token": block.token.get_secret_value()}
+
+
 def _workspace() -> WorkspaceClient:
-    """Ein WorkspaceClient pro Thread; Zugangsdaten aus dem Prefect Secret."""
+    """Ein WorkspaceClient pro Thread; Zugangsdaten aus dem Prefect-Block."""
     global _creds
     with _cred_lock:
         if _creds is None:
-            raw = Secret.load(CREDENTIALS_BLOCK).get()
-            _creds = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            _creds = _load_credentials()
     if getattr(_local, "ws", None) is None:
         _local.ws = WorkspaceClient(host=_creds["host"], token=_creds["token"])
     return _local.ws
@@ -269,8 +303,12 @@ def meteoswiss_to_volume(
     log = get_run_logger()
     volume_root = volume_root.rstrip("/")
 
-    station_ids = list_all_stations() if stations == ["all"] else [s.lower() for s in stations]
-    log.info("%d Stationen", len(station_ids))
+    stations = _normalize_list(stations)
+    granularities = _normalize_list(granularities)
+    periods = _normalize_list(periods)
+
+    station_ids = list_all_stations() if stations in ([], ["all"]) else stations
+    log.info("%d Stationen: %s", len(station_ids), ", ".join(station_ids[:10]))
 
     assets: list[Asset] = []
     for sid in station_ids:

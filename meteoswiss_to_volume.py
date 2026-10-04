@@ -15,9 +15,14 @@ Unveränderte Dateien werden übersprungen, geänderte überschrieben.
 Zugangsdaten: Prefect-Block vom Typ "Databricks Credentials" mit Namen
 "databricks-credentials" (Felder: Databricks Instance + Token).
 
+Downstream: Ist `databricks_job_id` gesetzt, startet der Flow am Ende den
+Databricks-Job (Volume -> Tabellen), sobald mindestens eine Datei geladen wurde.
+Ersetzt den File-Arrival-Trigger, der überschriebene Dateien nicht erkennt.
+
 Aufruf lokal (optional):
     python meteoswiss_to_volume.py                         # alle Stationen
     python meteoswiss_to_volume.py --stations chz lug      # nur bestimmte Stationen
+    python meteoswiss_to_volume.py --job-id 123456789      # danach Databricks-Job starten
 
 Quelle: MeteoSchweiz (Quellenangabe ist Lizenzbedingung).
 """
@@ -239,6 +244,14 @@ def ensure_directories(volume_root: str, folders: list[str]) -> None:
         ws.files.create_directory(f"{volume_root}/{DATASET}/{folder}")
 
 
+@task(retries=2, retry_delay_seconds=30, cache_policy=NO_CACHE)
+def trigger_databricks_job(job_id: int) -> int:
+    """Startet den Databricks-Job, der das Volume in die Tabellen lädt."""
+    run = _workspace().jobs.run_now(job_id=job_id)
+    get_run_logger().info("Databricks-Job %s gestartet (run_id=%s)", job_id, run.run_id)
+    return run.run_id
+
+
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -299,6 +312,7 @@ def meteoswiss_to_volume(
     volume_root: str = DEFAULT_VOLUME_ROOT,
     force: bool = False,
     verify_checksum: bool = True,
+    databricks_job_id: int | None = None,
 ) -> dict[str, int]:
     log = get_run_logger()
     volume_root = volume_root.rstrip("/")
@@ -348,6 +362,12 @@ def meteoswiss_to_volume(
     if loaded:
         save_manifest(volume_root, manifest)
 
+    # Downstream-Job nur starten, wenn wirklich neue/geänderte Dateien da sind
+    if loaded and databricks_job_id:
+        trigger_databricks_job(int(databricks_job_id))
+    elif databricks_job_id:
+        log.info("Keine neuen Dateien – Databricks-Job wird nicht gestartet")
+
     summary = {"loaded": loaded, "skipped": skipped, "failed": failed}
     log.info("Zusammenfassung: %s", summary)
     if failed:
@@ -367,6 +387,7 @@ if __name__ == "__main__":
     p.add_argument("--volume-root", default=DEFAULT_VOLUME_ROOT)
     p.add_argument("--no-metadata", action="store_true")
     p.add_argument("--force", action="store_true", help="alles neu hochladen")
+    p.add_argument("--job-id", type=int, default=None, help="Databricks-Job danach starten")
     a = p.parse_args()
     meteoswiss_to_volume(
         stations=a.stations,
@@ -376,4 +397,5 @@ if __name__ == "__main__":
         include_metadata=not a.no_metadata,
         volume_root=a.volume_root,
         force=a.force,
+        databricks_job_id=a.job_id,
     )

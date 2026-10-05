@@ -1,7 +1,7 @@
 """
 SLF IMIS -> R2 -> Databricks Bronze (-> Silver)
 
-Baut auf `r2_ingestion.py` (gleiches Repo) auf:
+Eigenständige Datei – enthält eine Kopie der Helfer aus `r2_ingestion.py`:
   * upload_to_r2(data, key)      – Rohdatei nach R2
   * ingest_r2_to_bronze(...)     – startet Databricks Job `r2_to_bronze` und wartet
 
@@ -24,26 +24,29 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin
 
+import boto3
 import httpx
 from botocore.exceptions import ClientError
 from prefect import flow, get_run_logger, task
+from prefect.blocks.system import Secret
 from prefect_databricks import DatabricksCredentials
 from prefect_databricks.flows import jobs_runs_submit_by_id_and_wait_for_completion
-
-from r2_ingestion import (
-    DATABRICKS_BLOCK,
-    R2_BUCKET,
-    _r2_client,
-    ingest_r2_to_bronze,
-    upload_to_r2,
-)
 
 # --------------------------------------------------------------------------- #
 # Konfiguration
 # --------------------------------------------------------------------------- #
+# Eigenständig (kein Import aus r2_ingestion.py): Prefect lädt das Skript ohne
+# den Repo-Ordner im Python-Pfad, Imports von Nachbardateien schlagen fehl.
+R2_ENDPOINT = "https://196684d5990e4e8c3f5ce5ba0dc956c3.r2.cloudflarestorage.com"
+R2_BUCKET = "blob"
+R2_ACCESS_KEY_BLOCK = "r2-access-key"     # Prefect Secret-Blocks (existieren bereits)
+R2_SECRET_KEY_BLOCK = "r2-secret-key"
+DATABRICKS_BLOCK = "databricks"
+BRONZE_JOB_ID: int | None = None          # gleiche Job-ID wie in r2_ingestion.py (Job `r2_to_bronze`)
+SILVER_JOB_ID: int | None = None          # Job-ID von `slf_imis_silver`, None = nicht starten
+
 R2_PREFIX = "slf-imis"
 SCHEMA = "workspace.slf"
-SILVER_JOB_ID: int | None = None          # Job-ID von `slf_imis_silver`, None = nicht starten
 
 API_BASE = "https://measurement-api.slf.ch/public/api/imis"
 ARCHIVE_BASE = "https://measurement-data.slf.ch/imis/"
@@ -83,6 +86,67 @@ BRONZE_HISTORY = [
 
 def _http() -> httpx.AsyncClient:
     return httpx.AsyncClient(headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT, follow_redirects=True)
+
+
+# --------------------------------------------------------------------------- #
+# R2 + Databricks (wie in r2_ingestion.py)
+# --------------------------------------------------------------------------- #
+_R2 = None
+
+
+async def _r2_client():
+    global _R2
+    if _R2 is None:
+        access_key = (await Secret.load(R2_ACCESS_KEY_BLOCK)).get()
+        secret_key = (await Secret.load(R2_SECRET_KEY_BLOCK)).get()
+        _R2 = boto3.client(
+            "s3",
+            endpoint_url=R2_ENDPOINT,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name="auto",
+        )
+    return _R2
+
+
+async def upload_to_r2(data: bytes, key: str) -> str:
+    client = await _r2_client()
+    await asyncio.to_thread(client.put_object, Bucket=R2_BUCKET, Key=key, Body=data)
+    get_run_logger().info("Hochgeladen: s3a://%s/%s (%.1f MB)", R2_BUCKET, key, len(data) / 1e6)
+    return f"s3a://{R2_BUCKET}/{key}"
+
+
+@flow(name="r2-to-bronze", log_prints=True)
+async def ingest_r2_to_bronze(
+    source_prefix: str,
+    target_table: str,
+    file_format: str = "csv",
+    file_pattern: str = "*",
+    csv_delimiter: str = ",",
+    sheet_name: str = "0",
+    full_refresh: bool = False,
+    max_wait_seconds: int = 3600,
+):
+    """Startet den Databricks Job `r2_to_bronze` und wartet, bis er fertig ist."""
+    if not BRONZE_JOB_ID:
+        raise ValueError("BRONZE_JOB_ID ist nicht gesetzt (Job-ID von r2_to_bronze eintragen).")
+    params = {
+        "source_prefix": source_prefix,
+        "target_table": target_table,
+        "file_format": file_format,
+        "file_pattern": file_pattern,
+        "csv_delimiter": csv_delimiter,
+        "sheet_name": sheet_name,
+        "full_refresh": str(full_refresh).lower(),
+    }
+    print(f"Starte Databricks Job {BRONZE_JOB_ID} mit {params}")
+    return await jobs_runs_submit_by_id_and_wait_for_completion(
+        databricks_credentials=await DatabricksCredentials.load(DATABRICKS_BLOCK),
+        job_id=BRONZE_JOB_ID,
+        notebook_params=params,
+        max_wait_seconds=max_wait_seconds,
+        poll_frequency_seconds=30,
+    )
 
 
 async def _run_bronze(specs: list[dict], csv_delimiter: str, full_refresh: bool) -> None:

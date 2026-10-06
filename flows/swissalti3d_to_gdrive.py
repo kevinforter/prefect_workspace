@@ -13,7 +13,7 @@ Ablauf
 Secrets / Blocks (Prefect Cloud) – dieselben wie slf_imis.py
 -------------------------------------------------------------
 - Secret `gdrive-token`            authorized_user-JSON (client_id, client_secret, refresh_token)
-- DatabricksCredentials `databricks`
+- DatabricksCredentials `databricks-credentials`
 - Root-Ordner: GDRIVE_ROOT_FOLDER_ID (fest im Code), Tiles landen in <root>/swissalti3d/
 
 Deploy
@@ -48,7 +48,7 @@ SOURCE_NAME = "swissalti3d"                 # Unterordner im Drive-Root-Ordner
 GDRIVE_ROOT_FOLDER_ID = "1anLG5HmPHSO1jknvM-iNTbQMNeQvXp1B"  # wie slf_imis.py / gdrive_upload.py
 GDRIVE_TOKEN_BLOCK = "gdrive-token"         # Prefect Secret-Block (authorized_user-JSON)
 GDRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
-DATABRICKS_BLOCK = "databricks"             # DatabricksCredentials-Block
+DATABRICKS_BLOCK = "databricks-credentials"  # DatabricksCredentials-Block (wie meteoswiss_to_volume.py)
 FOLDER_MIME = "application/vnd.google-apps.folder"
 DEFAULT_URLS_CSV = Path(__file__).parent / "data" / "swissalti3d_urls.csv"
 

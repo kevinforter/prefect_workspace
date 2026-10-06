@@ -233,10 +233,11 @@ def parse_ts(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
+# Epoch-Sekunden vergleichen -> unabhängig von der Session-Zeitzone
 logged = {
-    r.file_id: r.modified_time
+    r.file_id: r.mod_epoch
     for r in spark.sql(f"""
-        SELECT file_id, max(modified_time) AS modified_time
+        SELECT file_id, unix_timestamp(max(modified_time)) AS mod_epoch
         FROM {T_LOG}
         WHERE target_table = '{T_TERRAIN}'
         GROUP BY file_id
@@ -245,9 +246,9 @@ logged = {
 
 todo = []
 for f in sorted(drive_files, key=lambda f: f["name"]):
-    mod = parse_ts(f["modifiedTime"])
+    mod = parse_ts(f["modifiedTime"])  # tz-aware UTC
     prev = logged.get(f["id"])
-    if prev is None or mod.replace(tzinfo=None) > prev.replace(tzinfo=None):
+    if prev is None or int(mod.timestamp()) > prev:
         todo.append({**f, "modified": mod})
 
 if MAX_FILES:
@@ -389,7 +390,7 @@ def handle(f):
         meta = {
             "_source_file": f["name"],
             "_source_file_id": f["id"],
-            "_source_modified_at": f["modified"].replace(tzinfo=None),
+            "_source_modified_at": f["modified"],
         }
         tile_row.update(meta)
         for c, v in meta.items():
@@ -399,23 +400,30 @@ def handle(f):
         return f, None, None, f"{type(e).__name__}: {e}"
 
 
+def _py(v):
+    """Ein Wert -> reiner Python-Typ. Zeitstempel als tz-aware UTC-datetime (Spark Connect)."""
+    if v is None or v is pd.NaT:
+        return None
+    if isinstance(v, (float, np.floating)):
+        return None if v != v else float(v)
+    if isinstance(v, np.integer):
+        return int(v)
+    if isinstance(v, pd.Timestamp):
+        v = v.to_pydatetime()
+    if isinstance(v, datetime):
+        return v.replace(tzinfo=timezone.utc) if v.tzinfo is None else v.astimezone(timezone.utc)
+    return v
+
+
 def py_rows(pdf, cols):
     """pandas -> Liste von Tupeln mit Python-Typen, NaN -> None (wird zu NULL)."""
-    out = []
-    for rec in pdf[cols].astype(object).itertuples(index=False, name=None):
-        out.append(tuple(
-            None if v is None or (isinstance(v, float) and v != v)
-            else int(v) if isinstance(v, np.integer)
-            else float(v) if isinstance(v, np.floating)
-            else v
-            for v in rec
-        ))
-    return out
+    return [tuple(_py(v) for v in rec)
+            for rec in pdf[cols].astype(object).itertuples(index=False, name=None)]
 
 
 def to_spark(pdf, table, cols):
     pdf = pdf.copy()
-    pdf["_ingested_at"] = datetime.now(timezone.utc).replace(tzinfo=None)
+    pdf["_ingested_at"] = datetime.now(timezone.utc)
     return spark.createDataFrame(py_rows(pdf, cols), schema=spark.table(table).schema)
 
 
@@ -442,9 +450,9 @@ for start in range(0, len(todo), BATCH_SIZE):
     to_spark(pd.concat([d for _, _, d in ok], ignore_index=True), T_TERRAIN, TERRAIN_COLS) \
         .write.mode("append").saveAsTable(T_TERRAIN)
 
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = datetime.now(timezone.utc)
     log_rows = [
-        (f["id"], f["name"], f["modified"].replace(tzinfo=None), t, now)
+        (f["id"], f["name"], f["modified"], t, now)
         for f, _, _ in ok for t in (T_TILES, T_TERRAIN)
     ]
     spark.createDataFrame(log_rows, spark.table(T_LOG).schema).write.mode("append").saveAsTable(T_LOG)

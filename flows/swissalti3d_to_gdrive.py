@@ -83,15 +83,32 @@ def parse_tile(url: str) -> Tile | None:
     )
 
 
-def read_tile_list(urls_csv: str) -> list[Tile]:
-    """Liest die swisstopo-CSV (lokaler Pfad oder http(s)-URL)."""
+def resolve_urls_csv(urls_csv: str | None) -> Path | str:
+    """Leer/None -> mitgelieferte Liste neben dem Flow. Relative Pfade -> relativ zum Flow."""
+    if not urls_csv or not str(urls_csv).strip():
+        return DEFAULT_URLS_CSV
+    urls_csv = str(urls_csv).strip()
     if urls_csv.startswith(("http://", "https://")):
-        text = httpx.get(urls_csv, timeout=60, follow_redirects=True).text
+        return urls_csv
+    path = Path(urls_csv)
+    if path.exists():
+        return path
+    candidate = Path(__file__).parent / urls_csv
+    if candidate.exists():
+        return candidate
+    raise FileNotFoundError(
+        f"URL-Liste nicht gefunden: {urls_csv} (auch nicht unter {candidate}). "
+        "Liegt flows/data/swissalti3d_urls.csv im Repo?"
+    )
+
+
+def read_tile_list(urls_csv: str | None) -> list[Tile]:
+    """Liest die swisstopo-CSV (lokaler Pfad oder http(s)-URL)."""
+    src = resolve_urls_csv(urls_csv)
+    if isinstance(src, str):
+        text = httpx.get(src, timeout=60, follow_redirects=True).text
     else:
-        path = Path(urls_csv)
-        if not path.is_absolute() and not path.exists():
-            path = Path(__file__).parent / urls_csv
-        text = path.read_text(encoding="utf-8")
+        text = src.read_text(encoding="utf-8")
 
     tiles, seen = [], set()
     for line in text.splitlines():
@@ -322,7 +339,7 @@ def trigger_databricks_job(block_name: str, job_id: int, params: dict) -> int:
 # --------------------------------------------------------------------------- #
 @flow(name="swissalti3d-to-gdrive", log_prints=True)
 def swissalti3d_to_gdrive(
-    urls_csv: str = str(DEFAULT_URLS_CSV),
+    urls_csv: str | None = None,
     bbox_lv95_km: list[int] | None = None,
     max_tiles: int | None = None,
     batch_size: int = 200,
@@ -333,6 +350,8 @@ def swissalti3d_to_gdrive(
     databricks_block: str = "databricks-credentials",
 ) -> dict:
     """
+    urls_csv:     leer lassen = flows/data/swissalti3d_urls.csv aus dem Repo;
+                  sonst relativer Pfad, absoluter Pfad oder http(s)-URL
     bbox_lv95_km: [E_min, N_min, E_max, N_max] in km (untere linke Tile-Ecke),
                   z.B. ganz grob Graubünden: [2695, 1117, 2835, 1213]
     max_tiles:    Obergrenze pro Lauf (gut zum Testen, z.B. 20)

@@ -10,11 +10,11 @@ Ablauf
 5. Speicherkontingent laufend prüfen und vor dem Volllaufen stoppen
 6. Databricks Job `swissalti3d_to_bronze` starten
 
-Secrets / Blocks (Prefect Cloud)
---------------------------------
-- Secret `gdrive-oauth`            JSON mit client_id, client_secret, refresh_token
-- Secret `gdrive-root-folder-id`   Folder-ID von data_lake/raw/
-- DatabricksCredentials-Block      Name per Parameter `databricks_block`
+Secrets / Blocks (Prefect Cloud) – dieselben wie slf_imis.py
+-------------------------------------------------------------
+- Secret `gdrive-token`            authorized_user-JSON (client_id, client_secret, refresh_token)
+- DatabricksCredentials `databricks`
+- Root-Ordner: GDRIVE_ROOT_FOLDER_ID (fest im Code), Tiles landen in <root>/swissalti3d/
 
 Deploy
 ------
@@ -44,7 +44,11 @@ from prefect import flow, get_run_logger, task
 from prefect.blocks.system import Secret
 from prefect.cache_policies import NO_CACHE
 
-SOURCE_NAME = "swissalti3d"
+SOURCE_NAME = "swissalti3d"                 # Unterordner im Drive-Root-Ordner
+GDRIVE_ROOT_FOLDER_ID = "1anLG5HmPHSO1jknvM-iNTbQMNeQvXp1B"  # wie slf_imis.py / gdrive_upload.py
+GDRIVE_TOKEN_BLOCK = "gdrive-token"         # Prefect Secret-Block (authorized_user-JSON)
+GDRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+DATABRICKS_BLOCK = "databricks"             # DatabricksCredentials-Block
 FOLDER_MIME = "application/vnd.google-apps.folder"
 DEFAULT_URLS_CSV = Path(__file__).parent / "data" / "swissalti3d_urls.csv"
 
@@ -162,23 +166,18 @@ def _with_retries(fn, *, attempts: int = 5, base_delay: float = 2.0):
 _local = threading.local()
 
 
-def _drive_cfg() -> dict:
-    if not hasattr(_drive_cfg, "_cache"):
-        _drive_cfg._cache = json.loads(Secret.load("gdrive-oauth").get())
-    return _drive_cfg._cache
+def _token_info() -> dict:
+    if not hasattr(_token_info, "_cache"):
+        value = Secret.load(GDRIVE_TOKEN_BLOCK).get()
+        # Prefect liefert JSON-Secrets als dict, Text-Secrets als str
+        _token_info._cache = value if isinstance(value, dict) else json.loads(value)
+    return _token_info._cache
 
 
 def drive_service():
     """Ein Drive-Client pro Thread (httplib2 ist nicht thread-safe)."""
     if not hasattr(_local, "drive"):
-        cfg = _drive_cfg()
-        creds = Credentials(
-            token=None,
-            refresh_token=cfg["refresh_token"],
-            client_id=cfg["client_id"],
-            client_secret=cfg["client_secret"],
-            token_uri="https://oauth2.googleapis.com/token",
-        )
+        creds = Credentials.from_authorized_user_info(_token_info(), GDRIVE_SCOPES)
         _local.drive = build("drive", "v3", credentials=creds, cache_discovery=False)
     return _local.drive
 
@@ -347,7 +346,7 @@ def swissalti3d_to_gdrive(
     drive_reserve_gb: float = 1.0,
     trigger_job: bool = True,
     databricks_job_id: int | None = None,
-    databricks_block: str = "databricks-credentials",
+    databricks_block: str = DATABRICKS_BLOCK,
 ) -> dict:
     """
     urls_csv:     leer lassen = flows/data/swissalti3d_urls.csv aus dem Repo;
@@ -363,8 +362,7 @@ def swissalti3d_to_gdrive(
     tiles = filter_tiles(read_tile_list(urls_csv), bbox_lv95_km, None)
     log.info("%d Tiles in Auswahl (bbox=%s)", len(tiles), bbox_lv95_km)
 
-    root_id = Secret.load("gdrive-root-folder-id").get()
-    folder_id = get_or_create_folder(SOURCE_NAME, root_id)
+    folder_id = get_or_create_folder(SOURCE_NAME, GDRIVE_ROOT_FOLDER_ID)
     existing = list_existing_names(folder_id)
     missing = [t for t in tiles if t.name not in existing]
     already = len(tiles) - len(missing)

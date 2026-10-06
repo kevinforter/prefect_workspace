@@ -27,6 +27,7 @@
 
 dbutils.widgets.text("catalog", "workspace")
 dbutils.widgets.text("schema", "swisstopo")
+dbutils.widgets.text("root_folder_id", "1anLG5HmPHSO1jknvM-iNTbQMNeQvXp1B")
 dbutils.widgets.text("source_folder_id", "")          # von Prefect übergeben
 dbutils.widgets.text("source_folder_name", "swissalti3d")  # Fallback, falls keine ID
 dbutils.widgets.text("file_pattern", "swissalti3d_*.tif")
@@ -38,6 +39,7 @@ dbutils.widgets.text("max_workers", "8")
 
 CATALOG = dbutils.widgets.get("catalog")
 SCHEMA = dbutils.widgets.get("schema")
+ROOT_FOLDER_ID = dbutils.widgets.get("root_folder_id").strip()
 FOLDER_ID = dbutils.widgets.get("source_folder_id").strip()
 FOLDER_NAME = dbutils.widgets.get("source_folder_name").strip()
 FILE_PATTERN = dbutils.widgets.get("file_pattern")
@@ -156,19 +158,14 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
-_OAUTH = json.loads(dbutils.secrets.get("gdrive", "oauth_json"))
+_TOKEN = json.loads(dbutils.secrets.get("gdrive", "token"))  # wie gdrive_to_bronze
+_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 _local = threading.local()
 
 
 def drive():
     if not hasattr(_local, "svc"):
-        creds = Credentials(
-            token=None,
-            refresh_token=_OAUTH["refresh_token"],
-            client_id=_OAUTH["client_id"],
-            client_secret=_OAUTH["client_secret"],
-            token_uri="https://oauth2.googleapis.com/token",
-        )
+        creds = Credentials.from_authorized_user_info(_TOKEN, _SCOPES)
         _local.svc = build("drive", "v3", credentials=creds, cache_discovery=False)
     return _local.svc
 
@@ -189,11 +186,11 @@ def with_retries(fn, attempts=5, delay=2.0):
 def resolve_folder_id():
     if FOLDER_ID:
         return FOLDER_ID
-    q = (f"name = '{FOLDER_NAME}' and mimeType = 'application/vnd.google-apps.folder' "
-         "and trashed = false")
+    q = (f"name = '{FOLDER_NAME}' and '{ROOT_FOLDER_ID}' in parents "
+         "and mimeType = 'application/vnd.google-apps.folder' and trashed = false")
     res = drive().files().list(q=q, fields="files(id, name)").execute()["files"]
     if len(res) != 1:
-        raise ValueError(f"Ordner '{FOLDER_NAME}' {len(res)}x gefunden – source_folder_id setzen.")
+        raise ValueError(f"Ordner '{FOLDER_NAME}' {len(res)}x unter {ROOT_FOLDER_ID} gefunden – source_folder_id setzen.")
     return res[0]["id"]
 
 
